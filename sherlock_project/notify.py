@@ -110,7 +110,8 @@ class QueryNotifyPrint(QueryNotify):
     Query notify class that prints results.
     """
 
-    def __init__(self, result=None, verbose=False, print_all=False, browse=False):
+    def __init__(self, result=None, verbose=False, print_all=False, browse=False,
+                 show_timeout_tiers=False):
         """Create Query Notify Print Object.
 
         Contains information about a specific method of notifying the results
@@ -123,6 +124,10 @@ class QueryNotifyPrint(QueryNotify):
         verbose                -- Boolean indicating whether to give verbose output.
         print_all              -- Boolean indicating whether to only print all sites, including not found.
         browse                 -- Boolean indicating whether to open found sites in a web browser.
+        show_timeout_tiers     -- Boolean indicating whether to annotate each
+                                  result with the connect/read timeout tier that
+                                  was actually applied. Off by default so output
+                                  stays identical when no tiering is in effect.
 
         Return Value:
         Nothing.
@@ -132,6 +137,7 @@ class QueryNotifyPrint(QueryNotify):
         self.verbose = verbose
         self.print_all = print_all
         self.browse = browse
+        self.show_timeout_tiers = show_timeout_tiers
 
 
     def start(self, message):
@@ -189,8 +195,15 @@ class QueryNotifyPrint(QueryNotify):
         self.result = result
 
         response_time_text = ""
-        if self.result.query_time is not None and self.verbose is True:
-            response_time_text = f" [{round(self.result.query_time * 1000)}ms]"
+        if self.verbose is True:
+            if self.result.query_time is not None:
+                response_time_text = f" [{round(self.result.query_time * 1000)}ms]"
+            if self.show_timeout_tiers and self.result.timeout_level is not None:
+                # Show which timeout tier actually applied to this site.
+                response_time_text += (
+                    f" (timeout {self.result.timeout_connect:g}s"
+                    f"/{self.result.timeout_read:g}s, {self.result.timeout_level})"
+                )
 
         # Output to the terminal is desired.
         if result.status == QueryStatus.CLAIMED:
@@ -241,6 +254,20 @@ class QueryNotifyPrint(QueryNotify):
                       Fore.GREEN + f" {self.result.site_name}:" +
                       Fore.RED + " Blocked by bot detection" +
                       Fore.YELLOW + " (proxy may help)")
+
+        elif result.status == QueryStatus.TIMEOUT:
+            # Unfinished because of a timeout/budget is a conclusion of its
+            # own, always shown and never confused with "Not Found!".
+            timeout_detail = " Timed Out!"
+            if self.result.context is not None:
+                timeout_detail += f" {self.result.context}"
+            print(Style.BRIGHT + Fore.WHITE + "[" +
+                  Fore.MAGENTA + "~" +
+                  Fore.WHITE + "]" +
+                  response_time_text +
+                  Fore.GREEN + f" {self.result.site_name}:" +
+                  Fore.MAGENTA + timeout_detail +
+                  Fore.YELLOW + " ")
 
         else:
             # It should be impossible to ever get here...

@@ -34,6 +34,34 @@
           "type": "string",
           "enum": ["GET", "POST", "HEAD", "PUT"]
         },
+        "timeout": {
+          "description": "Per-site timeout in seconds, overriding the global default. A number applies to both connect and read phases; an object may set \"connect\" and/or \"read\" separately. Any omitted phase falls back to the global timeout.",
+          "oneOf": [
+            { "type": "number", "exclusiveMinimum": 0 },
+            {
+              "type": "object",
+              "properties": {
+                "connect": {
+                  "type": "number",
+                  "exclusiveMinimum": 0,
+                  "description": "Seconds to wait for a connection to be established."
+                },
+                "read": {
+                  "type": "number",
+                  "exclusiveMinimum": 0,
+                  "description": "Seconds to wait for data to be read after connecting."
+                }
+              },
+              "additionalProperties": false,
+              "minProperties": 1
+            }
+          ]
+        },
+        "budgetPolicy": {
+          "type": "string",
+          "enum": ["abandon", "wait"],
+          "description": "Per-site policy when the batch time budget (CLI --budget) is exhausted while this site's request is still pending. \"abandon\" gives up and marks the site 'Timed Out'; \"wait\" exempts the site from the budget. Defaults to the global --budget-policy."
+        },
         "errorType": {
           "oneOf": [
             {

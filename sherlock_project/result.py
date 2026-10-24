@@ -15,6 +15,7 @@ class QueryStatus(Enum):
     UNKNOWN   = "Unknown"   # Error Occurred While Trying To Detect Username
     ILLEGAL   = "Illegal"   # Username Not Allowable For This Site
     WAF       = "WAF"       # Request blocked by WAF (i.e. Cloudflare)
+    TIMEOUT   = "Timed Out" # Query did not finish in time (e.g. batch budget exhausted)
 
     def __str__(self):
         """Convert Object To String.
@@ -33,7 +34,8 @@ class QueryResult():
     Describes result of query about a given username.
     """
     def __init__(self, username, site_name, site_url_user, status,
-                 query_time=None, context=None):
+                 query_time=None, context=None, timeout_connect=None,
+                 timeout_read=None, timeout_level=None):
         """Create Query Result Object.
 
         Contains information about a specific method of detecting usernames on
@@ -57,6 +59,15 @@ class QueryResult():
                                   an error, this might indicate the type of
                                   error that occurred.
                                   Default of None.
+        timeout_connect        -- Effective connect timeout (in seconds)
+                                  used for this site's request.
+                                  Default of None.
+        timeout_read           -- Effective read timeout (in seconds)
+                                  used for this site's request.
+                                  Default of None.
+        timeout_level          -- String indicating which timeout tier was
+                                  used: "global" or "site".
+                                  Default of None.
 
         Return Value:
         Nothing.
@@ -68,6 +79,9 @@ class QueryResult():
         self.status        = status
         self.query_time    = query_time
         self.context       = context
+        self.timeout_connect = timeout_connect
+        self.timeout_read    = timeout_read
+        self.timeout_level   = timeout_level
 
 
     def __str__(self):

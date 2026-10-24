@@ -27,6 +27,7 @@ from time import monotonic
 from typing import Optional
 
 import requests
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from requests_futures.sessions import FuturesSession
 
 from sherlock_project.__init__ import (
@@ -109,17 +110,22 @@ class SherlockFuturesSession(FuturesSession):
         )
 
 
-def get_response(request_future, error_type, social_network):
+def get_response(request_future, error_type, social_network, result_timeout=None):
     # Default for Response object if some failure occurs.
     response = None
 
     error_context = "General Unknown Error"
     exception_text = None
+    budget_timed_out = False
     try:
-        response = request_future.result()
+        response = request_future.result(timeout=result_timeout)
         if response.status_code:
             # Status code exists in response object
             error_context = None
+    except FutureTimeoutError:
+        # The batch time budget ran out before this request returned.
+        budget_timed_out = True
+        error_context = "Batch Timeout"
     except requests.exceptions.HTTPError as errh:
         error_context = "HTTP Error"
         exception_text = str(errh)
@@ -139,7 +145,7 @@ def get_response(request_future, error_type, social_network):
         error_context = "Encoding Error"
         exception_text = str(err)
 
-    return response, error_context, exception_text
+    return response, error_context, exception_text, budget_timed_out
 
 
 def interpolate_string(input_object, username):
@@ -169,6 +175,130 @@ def multiple_usernames(username):
     return allUsernames
 
 
+BUDGET_POLICIES = ("abandon", "wait")
+
+
+def _coerce_timeout_seconds(value, location):
+    """Validate a single timeout value, returning a positive float.
+
+    Keyword Arguments:
+    value                  -- Timeout value declared in a manifest (must be
+                              a positive number).
+    location               -- String identifying the offending declaration
+                              for error messages.
+
+    Return Value:
+    Floating point number of seconds.
+
+    NOTE:  Raises ValueError if the value is not a positive number.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            f"Invalid timeout for {location}: {value!r}. "
+            "Timeout must be a positive number of seconds."
+        )
+
+    float_value = float(value)
+    if float_value <= 0:
+        raise ValueError(
+            f"Invalid timeout for {location}: {value!r}. "
+            "Timeout must be a positive number of seconds."
+        )
+
+    return float_value
+
+
+def resolve_site_timeouts(site_timeout, global_timeout):
+    """Resolve The Effective Timeouts For One Site.
+
+    The site manifest may declare its own timeout tier:
+
+      * omitted/None  -> the global --timeout value covers both phases
+      * a number      -> the same value covers connect and read
+      * an object     -> {"connect": seconds} and/or {"read": seconds};
+                         any phase not declared falls back to the global
+                         --timeout value
+
+    Keyword Arguments:
+    site_timeout           -- The "timeout" entry of a site's manifest
+                              (None, number, or dict).
+    global_timeout         -- The global timeout (from --timeout), used as
+                              the default for every undeclared phase.
+
+    Return Value:
+    Tuple of (request_timeout, connect_timeout, read_timeout, level).
+    "request_timeout" is the exact object handed to requests: a scalar for
+    the global tier (byte-for-byte identical to the historical behaviour)
+    and a (connect, read) tuple only when a site tier is in effect.
+    "level" is "global" or "site".
+    """
+    if site_timeout is None:
+        return global_timeout, global_timeout, global_timeout, "global"
+
+    if isinstance(site_timeout, (int, float)):
+        timeout = _coerce_timeout_seconds(site_timeout, "site")
+        return timeout, timeout, timeout, "site"
+
+    if isinstance(site_timeout, dict):
+        unknown_keys = set(site_timeout) - {"connect", "read"}
+        if unknown_keys:
+            raise ValueError(
+                f"Invalid site timeout declaration: {site_timeout!r}. "
+                f"Unknown key(s): {', '.join(sorted(unknown_keys))}. "
+                "Only 'connect' and 'read' are allowed."
+            )
+        if "connect" not in site_timeout and "read" not in site_timeout:
+            raise ValueError(
+                f"Invalid site timeout declaration: {site_timeout!r}. "
+                "Declare at least one of 'connect' or 'read'."
+            )
+        connect = (
+            _coerce_timeout_seconds(site_timeout["connect"], "site 'connect'")
+            if "connect" in site_timeout
+            else global_timeout
+        )
+        read = (
+            _coerce_timeout_seconds(site_timeout["read"], "site 'read'")
+            if "read" in site_timeout
+            else global_timeout
+        )
+        return (connect, read), connect, read, "site"
+
+    raise ValueError(
+        f"Invalid site timeout declaration: {site_timeout!r}. "
+        "Use a number or an object with optional 'connect'/'read' numbers."
+    )
+
+
+def timeouts_are_tiered(site_data, budget):
+    """Whether tiered-timeout output should be enabled for this batch.
+
+    Tiering is considered in effect as soon as a batch time budget is
+    given or any site declares its own timeout.  When neither applies,
+    behaviour is identical to the historical single global timeout.
+    """
+    return budget is not None or any(
+        net_info.get("timeout") is not None for net_info in site_data.values()
+    )
+
+
+def resolve_budget_policy(site_policy, global_policy):
+    """Resolve The Batch-Budget Policy For One Site.
+
+    "abandon" (default): when the batch budget is exhausted, sites still
+    pending are abandoned and marked as QueryStatus.TIMEOUT.
+    "wait": the site is exempted from the budget and may run until its own
+    request timeout concludes.
+    """
+    policy = site_policy if site_policy is not None else global_policy
+    if policy not in BUDGET_POLICIES:
+        raise ValueError(
+            f"Invalid batch budget policy: {policy!r}. "
+            f"Expected one of {', '.join(BUDGET_POLICIES)}."
+        )
+    return policy
+
+
 def sherlock(
     username: str,
     site_data: dict[str, dict[str, str]],
@@ -176,6 +306,8 @@ def sherlock(
     dump_response: bool = False,
     proxy: Optional[str] = None,
     timeout: int = 60,
+    budget: Optional[float] = None,
+    budget_policy: str = "abandon",
 ) -> dict[str, dict[str, str | QueryResult]]:
     """Run Sherlock Analysis.
 
@@ -190,7 +322,18 @@ def sherlock(
                               query results.
     proxy                  -- String indicating the proxy URL
     timeout                -- Time in seconds to wait before timing out request.
-                              Default is 60 seconds.
+                              Default is 60 seconds. Acts as the global
+                              default; individual sites may override it in
+                              the manifest (per connect/read phase).
+    budget                 -- Total time in seconds allowed for this whole
+                              batch (one username across all sites). When
+                              exhausted, sites still pending are handled per
+                              their budget policy. Default of None means no
+                              batch-level limit.
+    budget_policy          -- Default policy for pending sites when the budget
+                              is exhausted: "abandon" (mark Timed Out) or
+                              "wait" (let the request finish). Individual
+                              sites may override it in the manifest.
 
     Return Value:
     Dictionary containing results from report. Key of dictionary is the name
@@ -227,6 +370,12 @@ def sherlock(
     # Results from analysis of all sites
     results_total = {}
 
+    # Overall batch deadline when a total time budget was requested.
+    batch_started = monotonic()
+    batch_deadline = batch_started + budget if budget is not None else None
+    # Set to true if at least one site is abandoned waiting for the budget.
+    budget_abandoned_any = False
+
     # First create futures for all requests. This allows for the requests to run in parallel
     for social_network, net_info in site_data.items():
         # Results from analysis of this specific site
@@ -244,6 +393,18 @@ def sherlock(
             # Override/append any extra headers required by a given site.
             headers.update(net_info["headers"])
 
+        # Resolve the effective timeout tier for this site. Sites without
+        # their own declaration get the global timeout for both phases.
+        (
+            request_timeout,
+            timeout_connect,
+            timeout_read,
+            timeout_level,
+        ) = resolve_site_timeouts(net_info.get("timeout"), timeout)
+        results_site["timeout_connect"] = timeout_connect
+        results_site["timeout_read"] = timeout_read
+        results_site["timeout_level"] = timeout_level
+
         # URL of user on site (if it exists)
         url = interpolate_string(net_info["url"], username.replace(' ', '%20'))
 
@@ -252,7 +413,13 @@ def sherlock(
         if regex_check and re.search(regex_check, username) is None:
             # No need to do the check at the site: this username is not allowed.
             results_site["status"] = QueryResult(
-                username, social_network, url, QueryStatus.ILLEGAL
+                username,
+                social_network,
+                url,
+                QueryStatus.ILLEGAL,
+                timeout_connect=timeout_connect,
+                timeout_read=timeout_read,
+                timeout_level=timeout_level,
             )
             results_site["url_user"] = ""
             results_site["http_status"] = ""
@@ -319,7 +486,7 @@ def sherlock(
                     headers=headers,
                     proxies=proxies,
                     allow_redirects=allow_redirects,
-                    timeout=timeout,
+                    timeout=request_timeout,
                     json=request_payload,
                 )
             else:
@@ -327,7 +494,7 @@ def sherlock(
                     url=url_probe,
                     headers=headers,
                     allow_redirects=allow_redirects,
-                    timeout=timeout,
+                    timeout=request_timeout,
                     json=request_payload,
                 )
 
@@ -356,9 +523,49 @@ def sherlock(
 
         # Retrieve future and ensure it has finished
         future = net_info["request_future"]
-        r, error_text, exception_text = get_response(
-            request_future=future, error_type=error_type, social_network=social_network
+
+        # Determine how long we may still wait for this site. Sites using
+        # the "wait" policy are exempted from the batch budget and may run
+        # until their own request timeout concludes.
+        site_policy = resolve_budget_policy(
+            net_info.get("budgetPolicy"), budget_policy
         )
+        if batch_deadline is not None and site_policy != "wait":
+            result_timeout = max(batch_deadline - monotonic(), 0)
+        else:
+            result_timeout = None
+
+        r, error_text, exception_text, budget_timed_out = get_response(
+            request_future=future,
+            error_type=error_type,
+            social_network=social_network,
+            result_timeout=result_timeout,
+        )
+
+        if budget_timed_out:
+            # The batch budget is exhausted and this site never returned.
+            # Abandon the in-flight request, keep everything already learned
+            # about other sites, and explicitly mark this one as unfinished:
+            # Timed Out is a distinct status, never confused with Available.
+            future.cancel()
+            budget_abandoned_any = True
+            result = QueryResult(
+                username=username,
+                site_name=social_network,
+                site_url_user=url,
+                status=QueryStatus.TIMEOUT,
+                query_time=None,
+                context=f"Batch time budget of {budget:g}s exhausted before response",
+                timeout_connect=results_site["timeout_connect"],
+                timeout_read=results_site["timeout_read"],
+                timeout_level=results_site["timeout_level"],
+            )
+            query_notify.update(result)
+            results_site["status"] = result
+            results_site["http_status"] = ""
+            results_site["response_text"] = ""
+            results_total[social_network] = results_site
+            continue
 
         # Get response time for response of our request.
         try:
@@ -488,6 +695,9 @@ def sherlock(
             status=query_status,
             query_time=response_time,
             context=error_context,
+            timeout_connect=results_site["timeout_connect"],
+            timeout_read=results_site["timeout_read"],
+            timeout_level=results_site["timeout_level"],
         )
         query_notify.update(result)
 
@@ -500,6 +710,12 @@ def sherlock(
 
         # Add this site's results into final dictionary with all of the other results.
         results_total[social_network] = results_site
+
+    if budget_abandoned_any:
+        # Drop requests still queued and do not block on the ones already in
+        # flight: results already collected are final, the batch must not pay
+        # the slow sites' tail a second time while shutting down.
+        session.executor.shutdown(wait=False, cancel_futures=True)
 
     return results_total
 
@@ -623,7 +839,41 @@ def main():
         dest="timeout",
         type=timeout_check,
         default=60,
-        help="Time (in seconds) to wait for response to requests (Default: 60)",
+        help=(
+            "Default time (in seconds) to wait for responses to requests "
+            "(Default: 60). Used as the global default for both the connect "
+            "and read phases; individual sites may override either phase in "
+            "the JSON manifest with a \"timeout\" declaration."
+        ),
+    )
+    parser.add_argument(
+        "--budget",
+        action="store",
+        metavar="SECONDS",
+        dest="budget",
+        type=timeout_check,
+        default=None,
+        help=(
+            "Total time budget (in seconds) for one username across all "
+            "sites. When the budget is exhausted, sites still pending are "
+            "handled per --budget-policy and reported as 'Timed Out' while "
+            "results already obtained are kept. (Default: no budget)"
+        ),
+    )
+    parser.add_argument(
+        "--budget-policy",
+        action="store",
+        metavar="POLICY",
+        dest="budget_policy",
+        choices=BUDGET_POLICIES,
+        default="abandon",
+        help=(
+            "How to treat sites that are still pending when --budget is "
+            "exhausted: 'abandon' gives up on them and marks them 'Timed "
+            "Out' (default); 'wait' lets every request finish up to its own "
+            "timeout. Individual sites may override this in the manifest "
+            "with \"budgetPolicy\"."
+        ),
     )
     parser.add_argument(
         "--print-all",
@@ -799,9 +1049,18 @@ def main():
         if not site_data:
             sys.exit(1)
 
+    # Tiered timeouts are in effect when a batch budget was given or any
+    # selected site declares its own timeout. Drives extra result/export
+    # annotation; with neither set, output is identical to old behaviour.
+    timeouts_tiered = timeouts_are_tiered(site_data, args.budget)
+
     # Create notify object for query results.
     query_notify = QueryNotifyPrint(
-        result=None, verbose=args.verbose, print_all=args.print_all, browse=args.browse
+        result=None,
+        verbose=args.verbose,
+        print_all=args.print_all,
+        browse=args.browse,
+        show_timeout_tiers=timeouts_tiered,
     )
 
     # Run report on all specified users.
@@ -820,6 +1079,8 @@ def main():
             dump_response=args.dump_response,
             proxy=args.proxy,
             timeout=args.timeout,
+            budget=args.budget,
+            budget_policy=args.budget_policy,
         )
 
         if args.output:
@@ -852,39 +1113,55 @@ def main():
 
             with open(result_file, "w", newline="", encoding="utf-8") as csv_report:
                 writer = csv.writer(csv_report)
-                writer.writerow(
-                    [
-                        "username",
-                        "name",
-                        "url_main",
-                        "url_user",
-                        "exists",
-                        "http_status",
-                        "response_time_s",
+                header_row = [
+                    "username",
+                    "name",
+                    "url_main",
+                    "url_user",
+                    "exists",
+                    "http_status",
+                    "response_time_s",
+                ]
+                if timeouts_tiered:
+                    # Expose the effective connect/read timeout and the tier
+                    # (global vs site) that was actually used per site.
+                    header_row += [
+                        "timeout_connect_s",
+                        "timeout_read_s",
+                        "timeout_level",
                     ]
-                )
+                writer.writerow(header_row)
                 for site in results:
+                    site_status = results[site]["status"].status
                     if (
                         args.print_found
                         and not args.print_all
-                        and results[site]["status"].status != QueryStatus.CLAIMED
+                        and site_status not in (
+                            QueryStatus.CLAIMED,
+                            QueryStatus.TIMEOUT,
+                        )
                     ):
                         continue
 
                     response_time_s = results[site]["status"].query_time
                     if response_time_s is None:
                         response_time_s = ""
-                    writer.writerow(
-                        [
-                            username,
-                            site,
-                            results[site]["url_main"],
-                            results[site]["url_user"],
-                            str(results[site]["status"].status),
-                            results[site]["http_status"],
-                            response_time_s,
+                    row = [
+                        username,
+                        site,
+                        results[site]["url_main"],
+                        results[site]["url_user"],
+                        str(site_status),
+                        results[site]["http_status"],
+                        response_time_s,
+                    ]
+                    if timeouts_tiered:
+                        row += [
+                            results[site]["timeout_connect"],
+                            results[site]["timeout_read"],
+                            results[site]["timeout_level"],
                         ]
-                    )
+                    writer.writerow(row)
         if args.xlsx:
             usernames = []
             names = []
@@ -893,12 +1170,19 @@ def main():
             exists = []
             http_status = []
             response_time_s = []
+            timeout_connect_s = []
+            timeout_read_s = []
+            timeout_level = []
 
             for site in results:
+                site_status = results[site]["status"].status
                 if (
                     args.print_found
                     and not args.print_all
-                    and results[site]["status"].status != QueryStatus.CLAIMED
+                    and site_status not in (
+                        QueryStatus.CLAIMED,
+                        QueryStatus.TIMEOUT,
+                    )
                 ):
                     continue
 
@@ -910,20 +1194,29 @@ def main():
                 names.append(site)
                 url_main.append(results[site]["url_main"])
                 url_user.append(results[site]["url_user"])
-                exists.append(str(results[site]["status"].status))
+                exists.append(str(site_status))
                 http_status.append(results[site]["http_status"])
+                if timeouts_tiered:
+                    timeout_connect_s.append(results[site]["timeout_connect"])
+                    timeout_read_s.append(results[site]["timeout_read"])
+                    timeout_level.append(results[site]["timeout_level"])
 
-            DataFrame = pd.DataFrame(
-                {
-                    "username": usernames,
-                    "name": names,
-                    "url_main": [f'=HYPERLINK(\"{u}\")' for u in url_main],
-                    "url_user": [f'=HYPERLINK(\"{u}\")' for u in url_user],
-                    "exists": exists,
-                    "http_status": http_status,
-                    "response_time_s": response_time_s,
-                }
-            )
+            xlsx_data = {
+                "username": usernames,
+                "name": names,
+                "url_main": [f'=HYPERLINK(\"{u}\")' for u in url_main],
+                "url_user": [f'=HYPERLINK(\"{u}\")' for u in url_user],
+                "exists": exists,
+                "http_status": http_status,
+                "response_time_s": response_time_s,
+            }
+            if timeouts_tiered:
+                # Effective connect/read timeout and the tier actually used.
+                xlsx_data["timeout_connect_s"] = timeout_connect_s
+                xlsx_data["timeout_read_s"] = timeout_read_s
+                xlsx_data["timeout_level"] = timeout_level
+
+            DataFrame = pd.DataFrame(xlsx_data)
             DataFrame.to_excel(f"{username}.xlsx", sheet_name="sheet1", index=False)
 
         print()
