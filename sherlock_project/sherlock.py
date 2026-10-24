@@ -22,6 +22,7 @@ import pandas as pd
 import os
 import re
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
+from json import dumps as json_dumps
 from json import loads as json_loads
 from time import monotonic
 from typing import Optional
@@ -43,6 +44,13 @@ from sherlock_project.notify import QueryNotifyPrint
 from sherlock_project.sites import SitesInformation
 from colorama import init
 from argparse import ArgumentTypeError
+
+
+# A user agent is needed because some sites don't return the correct
+# information since they think that we are bots (Which we actually are...)
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:129.0) Gecko/20100101 Firefox/129.0",
+}
 
 
 class SherlockFuturesSession(FuturesSession):
@@ -236,9 +244,7 @@ def sherlock(
 
         # A user agent is needed because some sites don't return the correct
         # information since they think that we are bots (Which we actually are...)
-        headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:129.0) Gecko/20100101 Firefox/129.0",
-        }
+        headers = dict(DEFAULT_HEADERS)
 
         if "headers" in net_info:
             # Override/append any extra headers required by a given site.
@@ -504,6 +510,289 @@ def sherlock(
     return results_total
 
 
+def build_probe_plan(
+    username: str,
+    site_data: dict[str, dict],
+    timeout: float,
+    expanded_from: Optional[str] = None,
+) -> dict:
+    """Build a description of every request a run would make for one username.
+
+    This function performs no network input/output and does not mutate
+    ``site_data``. The request construction mirrors :func:`sherlock` exactly
+    (same URL interpolation, same default HTTP method selection, same payload
+    interpolation and same redirect policy) so the plan shows what a real run
+    would send.
+
+    Keyword Arguments:
+    username               -- String indicating username the plan is for.
+    site_data              -- Dictionary containing all of the site data.
+    timeout                -- Time in seconds that would be used for requests.
+    expanded_from          -- If this username was produced by the ``{?}``
+                              placeholder expansion, the original input it was
+                              expanded from. ``None`` for literal usernames.
+
+    Return Value:
+    Dictionary with four keys:
+        username:       The username this plan is for.
+        expanded_from:  The original input when ``username`` is an expansion
+                        variant, otherwise ``None``.
+        sites:          Sorted list of probe plans, one per site that would be
+                        queried (method, probe URL, payload, headers, redirect
+                        policy, timeout and detection rules).
+        skipped:        Sorted list of sites skipped before querying (with the
+                        ``regexCheck`` rule that rejected the username).
+    """
+    planned_sites = []
+    skipped_sites = []
+
+    for social_network in sorted(site_data, key=str.lower):
+        net_info = site_data[social_network]
+
+        # URL of user on site (if it exists), matching sherlock(): spaces in
+        # the username are percent-encoded in the profile URL.
+        url_user = interpolate_string(
+            net_info["url"], username.replace(" ", "%20")
+        )
+
+        # Don't query when the username is invalid for the site.
+        regex_check = net_info.get("regexCheck")
+        if regex_check and re.search(regex_check, username) is None:
+            skipped_sites.append(
+                {
+                    "site": social_network,
+                    "reason": "illegal_username",
+                    "username": username,
+                    "regex_check": regex_check,
+                    "url_user": url_user,
+                }
+            )
+            continue
+
+        url_probe = net_info.get("urlProbe")
+        if url_probe is None:
+            # Probe URL is the normal profile URL seen by people on the web.
+            url_probe = url_user
+        else:
+            # A dedicated probe URL. Note that, matching sherlock(), a separate
+            # urlProbe is interpolated with the raw username (no space
+            # percent-encoding).
+            url_probe = interpolate_string(url_probe, username)
+
+        # Resolve the request method exactly as sherlock() does: an explicit
+        # method wins; otherwise status_code detection defaults to HEAD and
+        # everything else to GET.
+        request_method = net_info.get("request_method")
+        if request_method is not None:
+            if request_method not in ("GET", "HEAD", "POST", "PUT"):
+                raise RuntimeError(
+                    f"Unsupported request_method for {url_probe}: {request_method}"
+                )
+            method = request_method
+        elif net_info["errorType"] == "status_code":
+            method = "HEAD"
+        else:
+            method = "GET"
+
+        request_payload = net_info.get("request_payload")
+        if request_payload is not None:
+            request_payload = interpolate_string(request_payload, username)
+
+        headers = dict(DEFAULT_HEADERS)
+        if "headers" in net_info:
+            # Override/append any extra headers required by a given site.
+            headers.update(net_info["headers"])
+
+        # response_url detection disables redirects; everything else allows
+        # them. Match the exact string comparison used at request time.
+        allow_redirects = net_info["errorType"] != "response_url"
+
+        error_type = net_info["errorType"]
+        if isinstance(error_type, str):
+            detection_methods = [error_type]
+        else:
+            detection_methods = list(error_type)
+
+        error_codes = net_info.get("errorCode")
+        if isinstance(error_codes, int):
+            error_codes = [error_codes]
+
+        planned_sites.append(
+            {
+                "site": social_network,
+                "url_main": net_info.get("urlMain"),
+                "url_user": url_user,
+                "request": {
+                    "method": method,
+                    "url": url_probe,
+                    "payload": request_payload,
+                    "headers": headers,
+                    "allow_redirects": allow_redirects,
+                    "timeout": timeout,
+                },
+                "detection": {
+                    "methods": detection_methods,
+                    "error_messages": net_info.get("errorMsg"),
+                    "error_codes": error_codes,
+                    "error_url": net_info.get("errorUrl"),
+                },
+            }
+        )
+
+    return {
+        "username": username,
+        "expanded_from": expanded_from,
+        "sites": planned_sites,
+        "skipped": skipped_sites,
+    }
+
+
+def run_dry_run(args) -> None:
+    """Print a machine-readable probe plan without any network or file I/O.
+
+    Loads the packaged local manifest (or a ``--json`` local file), applies the
+    same site/NSFW selection and username expansion as a normal run, and writes
+    the resulting probe plan as JSON to standard output.
+
+    Keyword Arguments:
+    args                   -- Parsed command-line arguments.
+
+    Return Value:
+    Nothing. Exits the process on invalid arguments or manifest errors.
+    """
+    forbidden_options = {
+        "output": "--output",
+        "folderoutput": "--folderoutput",
+        "csv": "--csv",
+        "xlsx": "--xlsx",
+        "output_txt": "--txt",
+        "browse": "--browse",
+    }
+    used_options = [
+        flag for attr, flag in forbidden_options.items() if getattr(args, attr)
+    ]
+    if used_options:
+        print(
+            "Error: --dry-run cannot be combined with file or browser options: "
+            + ", ".join(used_options),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if args.json_file:
+        # Dry-run performs no network requests, so URL manifests and pull
+        # request numbers (which resolve to URLs) are not allowed.
+        if args.json_file.isnumeric() or args.json_file.lower().startswith(
+            ("http://", "https://")
+        ):
+            print(
+                "Error: --dry-run performs no network requests, so --json must "
+                "point to a local data file. URLs and pull request numbers are "
+                "not supported.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        manifest_path = args.json_file
+        manifest_source = "local-file"
+    else:
+        manifest_path = os.path.join(
+            os.path.dirname(__file__), "resources/data.json"
+        )
+        manifest_source = "packaged"
+
+    # Exclusions are only available from a remote URL, so they are never
+    # fetched during a dry run.
+    try:
+        sites = SitesInformation(
+            data_file_path=manifest_path,
+            honor_exclusions=False,
+        )
+    except Exception as error:
+        print(f"ERROR:  {error}", file=sys.stderr)
+        sys.exit(1)
+
+    if not args.nsfw:
+        sites.remove_nsfw_sites(do_not_remove=args.site_list)
+
+    # Same site selection logic as in a normal run.
+    site_data_all = {site.name: site.information for site in sites}
+    if args.site_list == []:
+        site_data = site_data_all
+    else:
+        site_data = {}
+        site_missing = []
+        for site in args.site_list:
+            counter = 0
+            for existing_site in site_data_all:
+                if site.lower() == existing_site.lower():
+                    site_data[existing_site] = site_data_all[existing_site]
+                    counter += 1
+            if counter == 0:
+                site_missing.append(f"'{site}'")
+
+        if site_missing:
+            print(
+                f"Error: Desired sites not found: {', '.join(site_missing)}.",
+                file=sys.stderr,
+            )
+
+        if not site_data:
+            sys.exit(1)
+
+    # Expand {?} placeholders exactly like a normal run, recording the
+    # variants for the report.
+    username_expansion = []
+    plan_usernames: list[tuple[str, Optional[str]]] = []
+    for raw_username in args.username:
+        if check_for_parameter(raw_username):
+            variants = multiple_usernames(raw_username)
+            username_expansion.append(
+                {
+                    "input": raw_username,
+                    "placeholder": "{?}",
+                    "symbols": list(checksymbols),
+                    "variants": variants,
+                }
+            )
+            for variant in variants:
+                plan_usernames.append((variant, raw_username))
+        else:
+            plan_usernames.append((raw_username, None))
+
+    plans = [
+        build_probe_plan(
+            username, site_data, args.timeout, expanded_from=expanded_from
+        )
+        for username, expanded_from in plan_usernames
+    ]
+
+    document = {
+        "format": "sherlock.probe-plan",
+        "format_version": 1,
+        "dry_run": True,
+        "tool": {"name": __shortname__, "version": __version__},
+        "manifest": {
+            "source": manifest_source,
+            "path": os.path.abspath(manifest_path),
+            "exclusions_honored": False,
+        },
+        "options": {
+            "timeout": args.timeout,
+            "proxy": args.proxy,
+            "nsfw": bool(args.nsfw),
+            "sites_requested": list(args.site_list),
+        },
+        "username_expansion": username_expansion,
+        "plans": plans,
+    }
+
+    # Write UTF-8 bytes directly so non-ASCII manifest contents never depend on
+    # the platform's standard-output encoding.
+    sys.stdout.buffer.write(
+        (json_dumps(document, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    )
+
+
 def timeout_check(value):
     """Check Timeout Argument.
 
@@ -609,6 +898,18 @@ def main():
         help="Dump the HTTP response to stdout for targeted debugging.",
     )
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        default=False,
+        help="Print the probe plan as machine-readable JSON without making any "
+             "network requests or writing files. Lists request method, "
+             "interpolated probe URL, payload sample, detection rules and "
+             "effective timeout per site, plus sites rejected by regexCheck "
+             "and {?} placeholder expansion variants. Uses the packaged local "
+             "manifest; remote manifests/exclusions are not fetched.",
+    )
+    parser.add_argument(
         "--json",
         "-j",
         metavar="JSON_FILE",
@@ -697,6 +998,12 @@ def main():
 
     # If the user presses CTRL-C, exit gracefully without throwing errors
     signal.signal(signal.SIGINT, handler)
+
+    # Dry run prints a probe plan and returns before any network request or
+    # result file is produced.
+    if args.dry_run:
+        run_dry_run(args)
+        return
 
     # Check for newer version of Sherlock. If it exists, let the user know about it
     try:
