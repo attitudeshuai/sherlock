@@ -800,8 +800,12 @@ def main():
             sys.exit(1)
 
     # Create notify object for query results.
+    # The coverage lines (scanned sites vs manifest entries, exclusions and
+    # age-rating filtering) come from the selection ledger built while loading.
+    coverage_lines = sites.ledger.coverage_lines(len(site_data))
     query_notify = QueryNotifyPrint(
-        result=None, verbose=args.verbose, print_all=args.print_all, browse=args.browse
+        result=None, verbose=args.verbose, print_all=args.print_all, browse=args.browse,
+        coverage_lines=coverage_lines,
     )
 
     # Run report on all specified users.

@@ -110,7 +110,7 @@ class QueryNotifyPrint(QueryNotify):
     Query notify class that prints results.
     """
 
-    def __init__(self, result=None, verbose=False, print_all=False, browse=False):
+    def __init__(self, result=None, verbose=False, print_all=False, browse=False, coverage_lines=None):
         """Create Query Notify Print Object.
 
         Contains information about a specific method of notifying the results
@@ -123,6 +123,11 @@ class QueryNotifyPrint(QueryNotify):
         verbose                -- Boolean indicating whether to give verbose output.
         print_all              -- Boolean indicating whether to only print all sites, including not found.
         browse                 -- Boolean indicating whether to open found sites in a web browser.
+        coverage_lines         -- Optional list of pre-rendered strings
+                                  describing site coverage (scanned vs manifest
+                                  counts, exclusions, age-rating filtering).
+                                  Printed once in the end-of-scan summary; when
+                                  None, no coverage output is produced.
 
         Return Value:
         Nothing.
@@ -132,6 +137,7 @@ class QueryNotifyPrint(QueryNotify):
         self.verbose = verbose
         self.print_all = print_all
         self.browse = browse
+        self.coverage_lines = coverage_lines
 
 
     def start(self, message):
@@ -266,6 +272,15 @@ class QueryNotifyPrint(QueryNotify):
               Fore.WHITE + f" {NumberOfResults} " +
               Fore.GREEN + "results" + Style.RESET_ALL
               )
+
+        if self.coverage_lines:
+            for coverage_line in self.coverage_lines:
+                print(Style.BRIGHT + Fore.GREEN + "[" +
+                      Fore.YELLOW + "*" +
+                      Fore.GREEN + "]" +
+                      Fore.WHITE + f" {coverage_line}" +
+                      Style.RESET_ALL
+                      )
 
         print("\nGo deeper than a username. Explore public profiles and export your findings.")
         print("Try OSINTSearch: \033]8;;https://osintsearch.org/go/sherlock\033\\https://osintsearch.org\033]8;;\033\\")
