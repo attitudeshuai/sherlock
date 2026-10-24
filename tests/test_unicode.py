@@ -22,7 +22,7 @@ def test_get_response_handles_unicode_decode_error():
     future = _make_future_with_exception(
         UnicodeDecodeError("utf-8", b"\xe9", 0, 1, "invalid continuation byte")
     )
-    response, error_context, exception_text = get_response(
+    response, error_context, exception_text, redirect_truncated = get_response(
         request_future=future,
         error_type=["status_code"],
         social_network="TestSite",
@@ -30,6 +30,7 @@ def test_get_response_handles_unicode_decode_error():
     assert response is None
     assert error_context == "Encoding Error"
     assert "utf-8" in exception_text
+    assert redirect_truncated is False
 
 
 def test_get_response_handles_unicode_encode_error():
@@ -37,7 +38,7 @@ def test_get_response_handles_unicode_encode_error():
     future = _make_future_with_exception(
         UnicodeEncodeError("ascii", "É", 0, 1, "ordinal not in range(128)")
     )
-    response, error_context, exception_text = get_response(
+    response, error_context, exception_text, redirect_truncated = get_response(
         request_future=future,
         error_type=["status_code"],
         social_network="TestSite",
@@ -45,3 +46,4 @@ def test_get_response_handles_unicode_encode_error():
     assert response is None
     assert error_context == "Encoding Error"
     assert "ascii" in exception_text
+    assert redirect_truncated is False

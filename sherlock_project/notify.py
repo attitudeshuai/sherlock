@@ -173,6 +173,48 @@ class QueryNotifyPrint(QueryNotify):
         globvar += 1
         return globvar
 
+    def redirect_suffix(self, result):
+        """One-line redirect evidence for a query result.
+
+        Shows the final landing URL (or the refused first-hop target when
+        redirects were not followed), the number of hops, and a truncation
+        warning.  Returns an empty string when there is nothing to report, so
+        output for redirect-free queries is unchanged.
+        """
+        chain = getattr(result, "redirect_chain", None)
+        if not chain:
+            return ""
+
+        landing = getattr(result, "final_url", None)
+        if not landing:
+            # Redirects were refused (response_url sites) or no landing was
+            # reached: the last hop's target is the address of interest.
+            landing = chain[-1].location
+
+        hop_word = "hop" if len(chain) == 1 else "hops"
+        detail = f"{len(chain)} {hop_word}"
+        if getattr(result, "redirect_truncated", False):
+            detail += ", chain truncated at hop limit"
+
+        if landing:
+            return Fore.CYAN + f" -> {landing} ({detail})" + Style.RESET_ALL
+        return Fore.CYAN + f" ({detail})" + Style.RESET_ALL
+
+    def print_redirect_chain(self, result):
+        """Print every recorded hop on its own line when running verbose.
+
+        Only emitted in verbose mode and for queries that actually produced a
+        redirect chain.  Purely diagnostic; the verdict line is unaffected.
+        """
+        if not (self.verbose and getattr(result, "redirect_chain", None)):
+            return
+        for hop in result.redirect_chain:
+            print(Fore.CYAN + f"      {hop.status_code} -> {hop.location}"
+                  + Style.RESET_ALL)
+        if getattr(result, "redirect_truncated", False):
+            print(Fore.RED + "      redirect chain truncated at hop limit"
+                  + Style.RESET_ALL)
+
     def update(self, result):
         """Notify Update.
 
@@ -192,6 +234,8 @@ class QueryNotifyPrint(QueryNotify):
         if self.result.query_time is not None and self.verbose is True:
             response_time_text = f" [{round(self.result.query_time * 1000)}ms]"
 
+        redirect_suffix = self.redirect_suffix(result)
+
         # Output to the terminal is desired.
         if result.status == QueryStatus.CLAIMED:
             self.countResults()
@@ -202,7 +246,9 @@ class QueryNotifyPrint(QueryNotify):
                   Fore.GREEN +
                   f" {self.result.site_name}: " +
                   Style.RESET_ALL +
-                  f"{self.result.site_url_user}")
+                  f"{self.result.site_url_user}" +
+                  redirect_suffix)
+            self.print_redirect_chain(result)
             if self.browse:
                 webbrowser.open(self.result.site_url_user, 2)
 
@@ -213,16 +259,21 @@ class QueryNotifyPrint(QueryNotify):
                       Fore.WHITE + "]" +
                       response_time_text +
                       Fore.GREEN + f" {self.result.site_name}:" +
-                      Fore.YELLOW + " Not Found!")
+                      Fore.YELLOW + " Not Found!" +
+                      redirect_suffix)
+                self.print_redirect_chain(result)
 
         elif result.status == QueryStatus.UNKNOWN:
             if self.print_all:
                 print(Style.BRIGHT + Fore.WHITE + "[" +
                       Fore.RED + "-" +
                       Fore.WHITE + "]" +
+                      response_time_text +
                       Fore.GREEN + f" {self.result.site_name}:" +
                       Fore.RED + f" {self.result.context}" +
+                      redirect_suffix +
                       Fore.YELLOW + " ")
+                self.print_redirect_chain(result)
 
         elif result.status == QueryStatus.ILLEGAL:
             if self.print_all:
@@ -238,9 +289,12 @@ class QueryNotifyPrint(QueryNotify):
                 print(Style.BRIGHT + Fore.WHITE + "[" +
                       Fore.RED + "-" +
                       Fore.WHITE + "]" +
+                      response_time_text +
                       Fore.GREEN + f" {self.result.site_name}:" +
                       Fore.RED + " Blocked by bot detection" +
-                      Fore.YELLOW + " (proxy may help)")
+                      Fore.YELLOW + " (proxy may help)" +
+                      redirect_suffix)
+                self.print_redirect_chain(result)
 
         else:
             # It should be impossible to ever get here...

@@ -25,6 +25,7 @@ from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from json import loads as json_loads
 from time import monotonic
 from typing import Optional
+from urllib.parse import urljoin
 
 import requests
 from requests_futures.sessions import FuturesSession
@@ -38,6 +39,7 @@ from sherlock_project.__init__ import (
 
 from sherlock_project.result import QueryStatus
 from sherlock_project.result import QueryResult
+from sherlock_project.result import RedirectHop
 from sherlock_project.notify import QueryNotify
 from sherlock_project.notify import QueryNotifyPrint
 from sherlock_project.sites import SitesInformation
@@ -109,17 +111,32 @@ class SherlockFuturesSession(FuturesSession):
         )
 
 
+# Maximum number of redirect hops recorded (and followed) per query.  Chains
+# longer than this -- for example redirect loops -- are cut off at this point
+# and flagged as truncated.  The value matches requests' own default limit, so
+# detection verdicts are unchanged.
+MAX_REDIRECT_HOPS = 30
+
+
 def get_response(request_future, error_type, social_network):
     # Default for Response object if some failure occurs.
     response = None
 
     error_context = "General Unknown Error"
     exception_text = None
+    redirect_truncated = False
     try:
         response = request_future.result()
         if response.status_code:
             # Status code exists in response object
             error_context = None
+    except requests.exceptions.TooManyRedirects as errr:
+        # Redirect loop or chain longer than MAX_REDIRECT_HOPS.  The response
+        # hook kept an ordered trace of every observed hop; flag truncation so
+        # the chain can be salvaged and recorded.  Verdict stays UNKNOWN.
+        error_context = "Too Many Redirects"
+        exception_text = str(errr)
+        redirect_truncated = True
     except requests.exceptions.HTTPError as errh:
         error_context = "HTTP Error"
         exception_text = str(errh)
@@ -139,7 +156,119 @@ def get_response(request_future, error_type, social_network):
         error_context = "Encoding Error"
         exception_text = str(err)
 
-    return response, error_context, exception_text
+    return response, error_context, exception_text, redirect_truncated
+
+
+def _redirect_location(response):
+    """Resolve the absolute target address of a redirect response.
+
+    Reads the Location header and resolves relative addresses against the URL
+    that produced the response, mirroring how requests itself follows links.
+
+    Keyword Arguments:
+    response               -- requests Response object.
+
+    Return Value:
+    Absolute target URL string, or None when no Location header is present.
+    """
+    location = response.headers.get("Location")
+    if location is None:
+        return None
+    return urljoin(response.url, location)
+
+
+def build_redirect_chain(response, redirect_trace, follow_redirects, truncated):
+    """Build the ordered redirect chain left by a query.
+
+    For sites whose redirects are followed, each hop's status code and target
+    address are taken from the response history, together with the final
+    landing URL.  For sites judged by response URL (redirects intentionally
+    refused), the single rejected first hop (status code plus the Location
+    target from the response header) is registered.
+
+    When the hop limit is reached (or no final response is available), the
+    chain is salvaged from the per-request response hook trace.  A truncated
+    chain keeps one trailing entry for the hop that was refused because the
+    limit was hit, so redirect loops remain visible; callers must rely on the
+    truncated flag rather than treating that target as visited.
+
+    This is diagnostic data only: it must never feed the detection verdict.
+
+    Keyword Arguments:
+    response               -- Final requests Response object, or None if the
+                              future failed.
+    redirect_trace         -- Responses observed in order by the per-request
+                              response hook.
+    follow_redirects       -- Whether redirects were followed for this query.
+    truncated              -- True when the chain was cut at the hop limit.
+
+    Return Value:
+    Tuple (hops, final_url): list of RedirectHop objects and final landing URL
+    string (None when no landing was reached).
+    """
+    if response is not None and not truncated:
+        if follow_redirects:
+            history = list(response.history)
+            if not history:
+                return [], None
+            hops = []
+            for index, hop_response in enumerate(history):
+                if index + 1 < len(history):
+                    target = history[index + 1].url
+                else:
+                    # Last redirect: target is the final landing URL.
+                    target = response.url
+                hops.append(RedirectHop(hop_response.status_code, target))
+            return hops, response.url
+
+        # Redirects are intentionally refused: register the rejected first
+        # hop, using the Location header of the response.
+        if response.is_redirect:
+            return [RedirectHop(response.status_code, _redirect_location(response))], None
+        return [], None
+
+    # No final response (error) or hop limit reached: reconstruct as much of
+    # the chain as possible from the hook trace.
+    hops = []
+    for index, hop_response in enumerate(redirect_trace):
+        if index + 1 < len(redirect_trace):
+            # Target is the URL of the response actually observed next.
+            target = redirect_trace[index + 1].url
+        else:
+            # Trailing response with no successor: record where it was
+            # pointing (un-followed), or None when it was not a redirect.
+            target = _redirect_location(hop_response)
+        if target is None and not truncated:
+            # A non-redirect response with no successor is a landing, not a
+            # hop; without a final response object there is no landing to
+            # report, so skip it.
+            continue
+        hops.append(RedirectHop(hop_response.status_code, target))
+
+    return hops, None
+
+
+def format_redirect_chain(redirect_chain, truncated):
+    """Serialize a redirect chain into a single exportable string.
+
+    Hops are rendered as "<status_code> <target>" and joined in order with
+    " | ".  A chain cut off at the hop limit gets an explicit TRUNCATED
+    marker as its final entry.
+
+    Keyword Arguments:
+    redirect_chain         -- List of RedirectHop() objects.
+    truncated              -- Boolean truncation flag.
+
+    Return Value:
+    String describing the full chain, or an empty string when there are no
+    hops.
+    """
+    rendered_hops = [
+        f"{hop.status_code} {hop.location}".strip() for hop in redirect_chain
+    ]
+    if truncated:
+        rendered_hops.append("TRUNCATED")
+    return " | ".join(rendered_hops)
 
 
 def interpolate_string(input_object, username):
@@ -204,6 +333,14 @@ def sherlock(
                        site.
         response_text: Text that came back from request.  May be None if
                        there was an HTTP error when checking for existence.
+        redirect_chain: List of RedirectHop() objects holding each redirect
+                       hop's status code and target address, in order. Empty
+                       when no redirect occurred.
+        final_url:     Final landing URL after following redirects. Empty
+                       string when redirects were not followed or no landing
+                       was reached.
+        redirect_truncated: True when the redirect chain was cut off at
+                       MAX_REDIRECT_HOPS (e.g. a redirect loop).
     """
 
     # Notify caller that we are starting the query.
@@ -211,6 +348,11 @@ def sherlock(
 
     # Normal requests
     underlying_session = requests.session()
+
+    # Bound redirect chains so a redirect loop or an over-long chain can
+    # never produce an unbounded number of requests.  Chains hitting this
+    # limit are recorded up to the limit and flagged as truncated.
+    underlying_session.max_redirects = MAX_REDIRECT_HOPS
 
     # Limit number of workers to 20.
     # This is probably vastly overkill.
@@ -257,6 +399,9 @@ def sherlock(
             results_site["url_user"] = ""
             results_site["http_status"] = ""
             results_site["response_text"] = ""
+            results_site["redirect_chain"] = []
+            results_site["final_url"] = ""
+            results_site["redirect_truncated"] = False
             query_notify.update(results_site["status"])
         else:
             # URL of user on site (if it exists)
@@ -311,6 +456,23 @@ def sherlock(
                 # The final result of the request will be what is available.
                 allow_redirects = True
 
+            # Per-request trace of every response observed, including each
+            # intermediate 3xx response when redirects are followed.  Keeps
+            # the hops even when TooManyRedirects is raised, so redirect
+            # loops and over-long chains can still be recorded.
+            #
+            # The list is bound as the hook's default argument on purpose:
+            # this loop shares one local-variable cell across iterations, so
+            # a closure referencing ``redirect_trace`` directly would append
+            # every site's responses to the last iteration's list (hooks run
+            # later, in worker threads).
+            redirect_trace = []
+
+            def trace_redirect(resp, *args, _trace=redirect_trace, **kwargs):
+                _trace.append(resp)
+
+            request_hooks = {"response": trace_redirect}
+
             # This future starts running the request in a new thread, doesn't block the main thread
             if proxy is not None:
                 proxies = {"http": proxy, "https": proxy}
@@ -321,6 +483,7 @@ def sherlock(
                     allow_redirects=allow_redirects,
                     timeout=timeout,
                     json=request_payload,
+                    hooks=request_hooks,
                 )
             else:
                 future = request(
@@ -329,10 +492,13 @@ def sherlock(
                     allow_redirects=allow_redirects,
                     timeout=timeout,
                     json=request_payload,
+                    hooks=request_hooks,
                 )
 
             # Store future in data for access later
             net_info["request_future"] = future
+            # Store the trace alongside the future for result collection
+            net_info["redirect_trace"] = redirect_trace
 
         # Add this site's results into final dictionary with all the other results.
         results_total[social_network] = results_site
@@ -356,8 +522,19 @@ def sherlock(
 
         # Retrieve future and ensure it has finished
         future = net_info["request_future"]
-        r, error_text, exception_text = get_response(
+        r, error_text, exception_text, redirect_truncated = get_response(
             request_future=future, error_type=error_type, social_network=social_network
+        )
+
+        # Rebuild the redirect chain as diagnostic evidence.  Mirror the
+        # request-time redirect policy exactly: only response_url sites
+        # refused redirects.  This never feeds the verdict below.
+        follow_redirects = net_info["errorType"] != "response_url"
+        redirect_chain, final_url = build_redirect_chain(
+            response=r,
+            redirect_trace=net_info.get("redirect_trace", []),
+            follow_redirects=follow_redirects,
+            truncated=redirect_truncated,
         )
 
         # Get response time for response of our request.
@@ -477,6 +654,16 @@ def sherlock(
             except Exception:
                 pass
             print("<<<<< END RESPONSE TEXT")
+            if redirect_chain:
+                print(f"REDIRECT HOPS : {len(redirect_chain)}")
+                for hop in redirect_chain:
+                    print(f"  {hop.status_code} -> {hop.location}")
+            if final_url:
+                print(f"FINAL URL     : {final_url}")
+            if redirect_truncated:
+                print(
+                    f"REDIRECT CHAIN: TRUNCATED AT {MAX_REDIRECT_HOPS} HOP LIMIT"
+                )
             print("VERDICT       : " + str(query_status))
             print("+++++++++++++++++++++")
 
@@ -488,6 +675,9 @@ def sherlock(
             status=query_status,
             query_time=response_time,
             context=error_context,
+            redirect_chain=redirect_chain,
+            final_url=final_url,
+            redirect_truncated=redirect_truncated,
         )
         query_notify.update(result)
 
@@ -497,6 +687,11 @@ def sherlock(
         # Save results from request
         results_site["http_status"] = http_status
         results_site["response_text"] = response_text
+
+        # Save redirect trail (diagnostic only; verdict is unaffected)
+        results_site["redirect_chain"] = redirect_chain
+        results_site["final_url"] = final_url if final_url is not None else ""
+        results_site["redirect_truncated"] = redirect_truncated
 
         # Add this site's results into final dictionary with all of the other results.
         results_total[social_network] = results_site
@@ -861,6 +1056,10 @@ def main():
                         "exists",
                         "http_status",
                         "response_time_s",
+                        "redirect_hops",
+                        "final_url",
+                        "redirect_chain",
+                        "redirect_truncated",
                     ]
                 )
                 for site in results:
@@ -874,15 +1073,24 @@ def main():
                     response_time_s = results[site]["status"].query_time
                     if response_time_s is None:
                         response_time_s = ""
+                    site_result = results[site]
+                    redirect_chain = site_result.get("redirect_chain", [])
                     writer.writerow(
                         [
                             username,
                             site,
-                            results[site]["url_main"],
-                            results[site]["url_user"],
-                            str(results[site]["status"].status),
-                            results[site]["http_status"],
+                            site_result["url_main"],
+                            site_result["url_user"],
+                            str(site_result["status"].status),
+                            site_result["http_status"],
                             response_time_s,
+                            len(redirect_chain),
+                            site_result.get("final_url", ""),
+                            format_redirect_chain(
+                                redirect_chain,
+                                site_result.get("redirect_truncated", False),
+                            ),
+                            str(site_result.get("redirect_truncated", False)),
                         ]
                     )
         if args.xlsx:
@@ -893,6 +1101,10 @@ def main():
             exists = []
             http_status = []
             response_time_s = []
+            redirect_hops = []
+            final_url = []
+            redirect_chain = []
+            redirect_truncated = []
 
             for site in results:
                 if (
@@ -912,6 +1124,18 @@ def main():
                 url_user.append(results[site]["url_user"])
                 exists.append(str(results[site]["status"].status))
                 http_status.append(results[site]["http_status"])
+                site_chain = results[site].get("redirect_chain", [])
+                redirect_hops.append(len(site_chain))
+                final_url.append(results[site].get("final_url", ""))
+                redirect_chain.append(
+                    format_redirect_chain(
+                        site_chain,
+                        results[site].get("redirect_truncated", False),
+                    )
+                )
+                redirect_truncated.append(
+                    str(results[site].get("redirect_truncated", False))
+                )
 
             DataFrame = pd.DataFrame(
                 {
@@ -922,6 +1146,10 @@ def main():
                     "exists": exists,
                     "http_status": http_status,
                     "response_time_s": response_time_s,
+                    "redirect_hops": redirect_hops,
+                    "final_url": [f'=HYPERLINK(\"{u}\")' if u else "" for u in final_url],
+                    "redirect_chain": redirect_chain,
+                    "redirect_truncated": redirect_truncated,
                 }
             )
             DataFrame.to_excel(f"{username}.xlsx", sheet_name="sheet1", index=False)
