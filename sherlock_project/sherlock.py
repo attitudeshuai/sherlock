@@ -36,6 +36,11 @@ from sherlock_project.__init__ import (
     forge_api_latest_release,
 )
 
+from sherlock_project.checkpoint import (
+    Checkpoint,
+    CheckpointError,
+    DEFAULT_CHECKPOINT_FILE,
+)
 from sherlock_project.result import QueryStatus
 from sherlock_project.result import QueryResult
 from sherlock_project.notify import QueryNotify
@@ -176,6 +181,7 @@ def sherlock(
     dump_response: bool = False,
     proxy: Optional[str] = None,
     timeout: int = 60,
+    checkpoint: Optional[Checkpoint] = None,
 ) -> dict[str, dict[str, str | QueryResult]]:
     """Run Sherlock Analysis.
 
@@ -191,6 +197,10 @@ def sherlock(
     proxy                  -- String indicating the proxy URL
     timeout                -- Time in seconds to wait before timing out request.
                               Default is 60 seconds.
+    checkpoint             -- Optional Checkpoint object. Units with a
+                              recorded conclusion are restored from it
+                              without issuing any request; newly reached
+                              conclusions are registered on it immediately.
 
     Return Value:
     Dictionary containing results from report. Key of dictionary is the name
@@ -232,6 +242,19 @@ def sherlock(
         # Results from analysis of this specific site
         results_site = {"url_main": net_info.get("urlMain")}
 
+        # When resuming, a unit that already reached a conclusion is
+        # restored verbatim and no request is ever issued for it.
+        restored_record = (
+            checkpoint.get_record(username, social_network)
+            if checkpoint is not None
+            else None
+        )
+        if restored_record is not None:
+            results_site["url_user"] = restored_record["url_user"]
+            results_site["restored"] = restored_record
+            results_total[social_network] = results_site
+            continue
+
         # Record URL of main site
 
         # A user agent is needed because some sites don't return the correct
@@ -258,6 +281,19 @@ def sherlock(
             results_site["http_status"] = ""
             results_site["response_text"] = ""
             query_notify.update(results_site["status"])
+            if checkpoint is not None:
+                # Register the deterministic ILLEGAL conclusion so it is
+                # not evaluated again on resume.
+                checkpoint.record(
+                    username,
+                    social_network,
+                    status=QueryStatus.ILLEGAL.value,
+                    site_url_user=url,
+                    url_user="",
+                    http_status="",
+                    query_time=None,
+                    context=None,
+                )
         else:
             # URL of user on site (if it exists)
             results_site["url_user"] = url
@@ -347,6 +383,35 @@ def sherlock(
         status = results_site.get("status")
         if status is not None:
             # We have already determined the user doesn't exist here
+            continue
+
+        restored_record = results_site.pop("restored", None)
+        if restored_record is not None:
+            # Rebuild the QueryResult and per-site result structure from
+            # the previous run so the merged output is identical to a
+            # single uninterrupted scan. No request was issued above.
+            try:
+                restored_status = QueryStatus(restored_record["status"])
+            except ValueError:
+                # load_or_create() validates records, so this only
+                # happens for hand-crafted Checkpoint objects.
+                restored_status = QueryStatus.UNKNOWN
+            result: QueryResult = QueryResult(
+                username=username,
+                site_name=social_network,
+                site_url_user=restored_record["site_url_user"],
+                status=restored_status,
+                query_time=restored_record["query_time"],
+                context=restored_record["context"],
+            )
+            # Re-emit the result so console output (and the found-result
+            # counter) covers restored units as in a full run.
+            query_notify.update(result)
+
+            results_site["status"] = result
+            results_site["http_status"] = restored_record["http_status"]
+            results_site["response_text"] = b""
+            results_total[social_network] = results_site
             continue
 
         # Get the expected error type
@@ -500,6 +565,20 @@ def sherlock(
 
         # Add this site's results into final dictionary with all of the other results.
         results_total[social_network] = results_site
+
+        if checkpoint is not None:
+            # Persist this conclusion immediately: if the process dies
+            # now, this unit will never be queried again on resume.
+            checkpoint.record(
+                username,
+                social_network,
+                status=query_status.value,
+                site_url_user=url,
+                url_user=url,
+                http_status=http_status,
+                query_time=response_time,
+                context=error_context,
+            )
 
     return results_total
 
@@ -693,6 +772,25 @@ def main():
         help="Ignore upstream exclusions (may return more false positives)",
     )
 
+    parser.add_argument(
+        "--resume",
+        nargs="?",
+        metavar="STATE_FILE",
+        action="store",
+        dest="resume",
+        default=None,
+        const=DEFAULT_CHECKPOINT_FILE,
+        help=(
+            "Enable resumable scans and persist the status and conclusion "
+            "of every username/site unit to a JSON state file. On "
+            "interruption, re-run the exact same command with --resume to "
+            "skip units that already have a conclusion and merge them "
+            "into the results; only outstanding units are queried. The "
+            f"state file defaults to {DEFAULT_CHECKPOINT_FILE}, is safe to "
+            "inspect, and can be deleted to force a fresh start."
+        ),
+    )
+
     args = parser.parse_args()
 
     # If the user presses CTRL-C, exit gracefully without throwing errors
@@ -812,6 +910,39 @@ def main():
                 all_usernames.append(name)
         else:
             all_usernames.append(username)
+
+    # Optional resumable-scan state. When --resume is not given, no state
+    # file is touched and behavior/output are unchanged.
+    checkpoint = None
+    if args.resume is not None:
+        try:
+            checkpoint, resumed = Checkpoint.load_or_create(
+                args.resume,
+                usernames=all_usernames,
+                site_data=site_data,
+                sherlock_version=__version__,
+                proxy=args.proxy,
+                timeout=args.timeout,
+            )
+        except CheckpointError as error:
+            print(f"ERROR: {error}")
+            sys.exit(1)
+
+        total_units = len(all_usernames) * len(site_data)
+        if resumed:
+            print(
+                f"[*] Resuming scan from checkpoint file '{args.resume}'. "
+                f"{checkpoint.completed_unit_count()} of {total_units} "
+                "username/site units already have conclusions and will not "
+                "be queried again."
+            )
+        else:
+            print(
+                f"[*] Checkpoint enabled: progress will be continuously "
+                f"saved to '{args.resume}'. If this scan is interrupted, "
+                "re-run the same command with --resume to continue."
+            )
+
     for username in all_usernames:
         results = sherlock(
             username,
@@ -820,6 +951,7 @@ def main():
             dump_response=args.dump_response,
             proxy=args.proxy,
             timeout=args.timeout,
+            checkpoint=checkpoint,
         )
 
         if args.output:
@@ -927,6 +1059,10 @@ def main():
             DataFrame.to_excel(f"{username}.xlsx", sheet_name="sheet1", index=False)
 
         print()
+
+    if checkpoint is not None:
+        checkpoint.mark_batch_complete()
+
     query_notify.finish()
 
 
